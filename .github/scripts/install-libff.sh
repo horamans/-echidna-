@@ -30,7 +30,11 @@ if [ "$HOST_OS" = "macOS" ]; then
   sed -i '' 's/STATIC/SHARED/' depends/CMakeLists.txt
 fi
 
+if [ "$HOST_OS" = "Windows" ]; then
+  ARGS="$ARGS -G Ninja"
+fi
+
 mkdir -p build
 cd build
 CXXFLAGS="-fPIC $CXXFLAGS" cmake $ARGS ..
-make && make install
+cmake --build . && cmake --install .

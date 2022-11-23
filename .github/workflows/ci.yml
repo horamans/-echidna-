@@ -14,15 +14,20 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
         include:
           - os: ubuntu-latest
             apt-get: autoconf automake libtool
+            shell: bash
           - os: macos-latest
             brew: automake
-         
+            shell: bash
+          - os: windows-latest
+            shell: msys2 {0}
+
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+
     steps:
       - name: Workaround for actions/cache#403
         if: runner.os == 'macOS'
@@ -32,9 +37,24 @@ jobs:
 
       - name: Get Packages
         uses: mstksg/get-package@v1
+        if: runner.os != 'Windows'
         with:
           brew: ${{ matrix.brew }}
           apt-get: ${{ matrix.apt-get }}
+
+      - name: Get Packages (Windows)
+        uses: msys2/setup-msys2@v2
+        if: runner.os == 'Windows'
+        with:
+          update: true
+          install: >-
+            base-devel
+            git
+            unzip
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-autotools
 
       - name: Checkout
         uses: actions/checkout@v2
