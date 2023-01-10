@@ -6,7 +6,7 @@
 module Echidna.Campaign where
 
 import Control.Lens
-import Control.Monad (liftM3, replicateM, when, (<=<), ap, unless)
+import Control.Monad (liftM3, replicateM, when, (<=<), ap, unless, void)
 import Control.Monad.Catch (MonadCatch(..), MonadThrow(..))
 import Control.Monad.Random.Strict (MonadRandom, RandT, evalRandT, getRandomR, uniform, uniformMay)
 import Control.Monad.Reader.Class (MonadReader)
@@ -83,17 +83,13 @@ isSuccess = allOf (tests . traverse . testState) (\case { Passed -> True; Open _
 updateTest :: ( MonadCatch m, MonadRandom m, MonadReader x m
               , Has SolConf x, Has TestConf x, Has TxConf x, Has CampaignConf x, Has DappInfo x)
            => World -> VM -> Maybe (VM, [Tx]) -> EchidnaTest -> m EchidnaTest
-
-
 updateTest w vm (Just (vm', xs)) test = do
-  tl <- view (hasLens . testLimit)
   case test ^. testState of
-    Open i | i >= tl -> case test ^. testType of
-                          OptimizationTest _ _ -> pure $ test { _testState = Large (-1) }
-                          _                    -> pure $ test { _testState = Passed }
-    Open i           -> do r <- evalStateT (checkETest test) vm'
-                           pure $ updateOpenTest test xs i r
-    _                -> updateTest w vm Nothing test
+    Open i -> do
+      r <- evalStateT (checkETest test) vm'
+      pure $ updateOpenTest test xs i r
+    _ ->
+      updateTest w vm Nothing test
 
 updateTest _ vm Nothing test = do
   sl <- view (hasLens . shrinkLimit)
@@ -265,15 +261,16 @@ callseq ic v w ql = do
 
 -- | Run a fuzzing campaign given an initial universe state, some tests, and an optional dictionary
 -- to generate calls with. Return the 'Campaign' state once we can't solve or shrink anything.
-campaign :: ( MonadCatch m, MonadRandom m, MonadReader x m
-            , Has SolConf x, Has TestConf x, Has TxConf x, Has CampaignConf x, Has DappInfo x)
-         => StateT Campaign m a -- ^ Callback to run after each state update (for instrumentation)
-         -> VM                  -- ^ Initial VM state
-         -> World               -- ^ Initial world state
-         -> [EchidnaTest]       -- ^ Tests to evaluate
-         -> Maybe GenDict       -- ^ Optional generation dictionary
-         -> [[Tx]]              -- ^ Initial corpus of transactions
-         -> m Campaign
+campaign
+  :: ( MonadCatch m, MonadRandom m, MonadReader x m
+     , Has SolConf x, Has TestConf x, Has TxConf x, Has CampaignConf x, Has DappInfo x)
+  => StateT Campaign m Bool -- ^ Callback to run after each state update (for instrumentation)
+  -> VM                  -- ^ Initial VM state
+  -> World               -- ^ Initial world state
+  -> [EchidnaTest]       -- ^ Tests to evaluate
+  -> Maybe GenDict       -- ^ Optional generation dictionary
+  -> [[Tx]]              -- ^ Initial corpus of transactions
+  -> m Campaign
 campaign u vm w ts d txs = do
   c <- fromMaybe mempty <$> view (hasLens . knownCoverage)
   g <- view (hasLens . seed)
@@ -282,27 +279,21 @@ campaign u vm w ts d txs = do
       d' = fromMaybe defaultDict d
   execStateT
     (evalRandT runCampaign (mkStdGen effectiveSeed))
-    (Campaign
-      ts
-      c
-      mempty
-      effectiveGenDict
-      False
-      DS.empty
-      0
-      memo
-    )
+    (Campaign ts c mempty effectiveGenDict False DS.empty 0 memo)
   where
     -- "mapMaybe ..." is to get a list of all contracts
     ic          = (length txs, txs)
     memo        = makeBytecodeMemo . mapMaybe (viewBuffer . (^. bytecode)) . elems $ (vm ^. env . EVM.contracts)
-    step        = runUpdate (updateTest w vm Nothing) >> lift u >> runCampaign
+    step = do
+      runUpdate (updateTest w vm Nothing)
+      stop <- lift u -- callback can instruct the campaign to stop running
+      unless stop runCampaign
     runCampaign = use (hasLens . tests . to (fmap (view testState))) >>= update
     update c    = do
       CampaignConf tl sof _ q sl _ _ _ _ _ <- view hasLens
       Campaign { _ncallseqs } <- view hasLens <$> get
-      if | sof && any (\case Solved -> True; Failed _ -> True; _ -> False) c -> lift u
+      if | sof && any (\case Solved -> True; Failed _ -> True; _ -> False) c -> void $ lift u
          | any (\case Open  n   -> n < tl; _ -> False) c                       -> callseq ic vm w q >> step
          | any (\case Large n   -> n < sl; _ -> False) c                       -> step
          | null c && (q * _ncallseqs) < tl                                     -> callseq ic vm w q >> step
-         | otherwise                                                           -> lift u
+         | otherwise                                                           -> void $ lift u

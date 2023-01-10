@@ -41,7 +41,7 @@ import Echidna.RPC (loadEtheno, extractFromEtheno)
 -- * A list of transaction sequences to initialize the corpus
 prepareContract :: (MonadCatch m, MonadReader x m, MonadIO m, MonadFail m, Has SolConf x)
                 => EConfig -> NE.NonEmpty FilePath -> Maybe ContractName -> Seed
-                -> m (VM, SourceCache, [SolcContract], World, [EchidnaTest], Maybe GenDict, [[Tx]])
+                -> m (VM, SourceCache, [SolcContract], World, [EchidnaTest], GenDict, [[Tx]])
 prepareContract cfg fs c g = do
   ctxs1 <- liftIO $ loadTxs (fmap (++ "/reproducers/") cd)
   ctxs2 <- liftIO $ loadTxs (fmap (++ "/coverage/") cd)
@@ -74,7 +74,7 @@ prepareContract cfg fs c g = do
 
   -- start ui and run tests
   let sc = selectSourceCache c scs
-  return (v, sc, cs, w, ts, Just $ mkGenDict df constants' [] g (returnTypes cs), txs)
+  return (v, sc, cs, w, ts, mkGenDict df constants' [] g (returnTypes cs), txs)
   where cd = cfg ^. cConf . corpusDir
         df = cfg ^. cConf . dictFreq
         it = cfg ^. sConf . initialize

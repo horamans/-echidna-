@@ -5,7 +5,7 @@ maintainer: Trail of Bits <echidna-dev@trailofbits.com>
 
 version: 2.0.4
 
-ghc-options: -Wall -fno-warn-orphans -O2 -threaded +RTS -N -RTS
+ghc-options: -Wall -fno-warn-orphans -O2 -threaded +RTS -N -RTS -rtsopts
 
 dependencies:
   - base

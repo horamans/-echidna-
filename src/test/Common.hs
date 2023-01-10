@@ -89,7 +89,7 @@ runContract f mc cfg =
     let env = Env { _cfg = cfg, _dapp = dappInfo' }
     flip runReaderT env $
       -- start ui and run tests
-      campaign (pure ()) v w ts d txs
+      campaign (pure False) v w ts (Just d) txs
 
 testContract :: FilePath -> Maybe FilePath -> [(String, Campaign -> Bool)] -> TestTree
 testContract fp cfg = testContract' fp Nothing Nothing cfg True
