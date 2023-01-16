@@ -10,9 +10,8 @@ import Control.Monad.State.Strict (MonadState (get, put), execState, execState)
 import Data.Map qualified as M
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
-import Data.Word (Word64)
 
-import EVM
+import EVM hiding (tx)
 import EVM.Exec (exec, vmForEthrunCreation)
 import EVM.Types (Expr(ConcreteBuf, Lit))
 
@@ -62,80 +61,67 @@ vmExcept e = throwM $ case VMFailure e of {Illegal -> IllegalExec e; _ -> Unknow
 -- | Given an error handler `onErr`, an execution strategy `executeTx`, and a transaction `tx`,
 -- execute that transaction using the given execution strategy, calling `onErr` on errors.
 execTxWith :: MonadState s m => Lens' s VM -> (Error -> m ()) -> m VMResult -> Tx -> m (VMResult, Int)
-execTxWith l onErr executeTx tx' = do
+execTxWith l onErr executeTx tx = do
   vm <- use l
-  if hasSelfdestructed vm tx'.dst then
+  if hasSelfdestructed vm tx.dst then
     pure (VMFailure (Revert (ConcreteBuf "")), 0)
   else do
     l . traces .= emptyEvents
     vmBeforeTx <- use l
-    l %= execState (setupTx tx')
+    l %= execState (setupTx tx)
     gasLeftBeforeTx <- use $ l . state . gas
-    vmResult' <- executeTx
+    vmResult <- runFully
     gasLeftAfterTx <- use $ l . state . gas
-    checkAndHandleQuery l vmBeforeTx vmResult' onErr executeTx tx' gasLeftBeforeTx gasLeftAfterTx
-
-checkAndHandleQuery :: MonadState s m => Lens' s VM -> VM -> VMResult -> (Error -> m ()) -> m VMResult -> Tx -> Word64 -> Word64 -> m (VMResult, Int)
-checkAndHandleQuery l vmBeforeTx vmResult' onErr executeTx tx' gasLeftBeforeTx gasLeftAfterTx =
-        -- Continue transaction whose execution queried a contract or slot
-    let continueAfterQuery = do
-          -- Run remaining effects
-          vmResult'' <- executeTx
-          -- Correct gas usage
-          gasLeftAfterTx' <- use $ l . state . gas
-          checkAndHandleQuery l vmBeforeTx vmResult'' onErr executeTx tx' gasLeftBeforeTx gasLeftAfterTx'
-
-    in case getQuery vmResult' of
+    handleErrorsAndConstruction vmResult vmBeforeTx
+    pure (vmResult, fromIntegral $ gasLeftBeforeTx - gasLeftAfterTx)
+  where
+  runFully = do
+    vmResult <- executeTx
+    -- For queries, we halt execution because the VM needs some additional
+    -- information from the outside. We provide this information and resume
+    -- the execution by recursively calling `runFully`.
+    case getQuery vmResult of
       -- A previously unknown contract is required
       Just (PleaseFetchContract _ continuation) -> do
         -- Use the empty contract
         l %= execState (continuation emptyAccount)
-        continueAfterQuery
+        runFully
 
       -- A previously unknown slot is required
       Just (PleaseFetchSlot _ _ continuation) -> do
         -- Use the zero slot
         l %= execState (continuation 0)
-        continueAfterQuery
+        runFully
 
-      -- No queries to answer
-      _ -> do
-        handleErrorsAndConstruction l onErr vmResult' vmBeforeTx tx'
-        return (vmResult', fromIntegral $ gasLeftBeforeTx - gasLeftAfterTx)
+      -- No queries to answer, the tx is fully executed and the result is final
+      _ -> pure vmResult
 
--- | Handles reverts, failures and contract creations that might be the result
--- (`vmResult`) of executing transaction `tx`.
-handleErrorsAndConstruction :: MonadState s m
-                            => Lens' s VM
-                            -> (Error -> m ())
-                            -> VMResult
-                            -> VM
-                            -> Tx
-                            -> m ()
-handleErrorsAndConstruction l onErr vmResult' vmBeforeTx tx' = case (vmResult', tx'.call) of
-  (Reversion, _) -> do
-    tracesBeforeVMReset <- use $ l . traces
-    codeContractBeforeVMReset <- use $ l . state . codeContract
-    calldataBeforeVMReset <- use $ l . state . calldata
-    callvalueBeforeVMReset <- use $ l . state . callvalue
-    -- If a transaction reverts reset VM to state before the transaction.
-    l .= vmBeforeTx
-    -- Undo reset of some of the VM state.
-    -- Otherwise we'd loose all information about the reverted transaction like
-    -- contract address, calldata, result and traces.
-    l . result ?= vmResult'
-    l . state . calldata .= calldataBeforeVMReset
-    l . state . callvalue .= callvalueBeforeVMReset
-    l . traces .= tracesBeforeVMReset
-    l . state . codeContract .= codeContractBeforeVMReset
-  (VMFailure x, _) -> onErr x
-  (VMSuccess (ConcreteBuf bytecode'), SolCreate _) ->
-    -- Handle contract creation.
-    l %= execState (do
-      env . contracts . at tx'.dst . _Just . contractcode .= InitCode mempty mempty
-      replaceCodeOfSelf (RuntimeCode (ConcreteRuntimeCode bytecode'))
-      loadContract tx'.dst)
-  _ -> pure ()
+  -- | Handles reverts, failures and contract creations that might be the result
+  -- (`vmResult`) of executing transaction `tx`.
+  handleErrorsAndConstruction vmResult vmBeforeTx = case (vmResult, tx.call) of
+    (Reversion, _) -> do
+      tracesBeforeVMReset <- use $ l . traces
+      codeContractBeforeVMReset <- use $ l . state . codeContract
+      calldataBeforeVMReset <- use $ l . state . calldata
+      callvalueBeforeVMReset <- use $ l . state . callvalue
+      -- If a transaction reverts reset VM to state before the transaction.
+      l .= vmBeforeTx
+      -- Undo reset of some of the VM state.
+      -- Otherwise we'd loose all information about the reverted transaction like
+      -- contract address, calldata, result and traces.
+      l . result ?= vmResult
+      l . state . calldata .= calldataBeforeVMReset
+      l . state . callvalue .= callvalueBeforeVMReset
+      l . traces .= tracesBeforeVMReset
+      l . state . codeContract .= codeContractBeforeVMReset
+    (VMFailure x, _) -> onErr x
+    (VMSuccess (ConcreteBuf bytecode'), SolCreate _) ->
+      -- Handle contract creation.
+      l %= execState (do
+        env . contracts . at tx.dst . _Just . contractcode .= InitCode mempty mempty
+        replaceCodeOfSelf (RuntimeCode (ConcreteRuntimeCode bytecode'))
+        loadContract tx.dst)
+    _ -> pure ()
 
 -- | Execute a transaction "as normal".
 execTx :: (MonadState VM m, MonadThrow m) => Tx -> m (VMResult, Int)
