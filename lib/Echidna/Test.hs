@@ -6,7 +6,7 @@ import Prelude hiding (Word)
 
 import Control.Monad.Catch (MonadThrow)
 import Control.Monad.Reader.Class (MonadReader, asks)
-import Control.Monad.State.Strict (MonadState(get, put), gets)
+import Control.Monad.State.Strict (MonadState(get, put), gets, MonadIO)
 import Data.ByteString qualified as BS
 import Data.ByteString.Lazy qualified as LBS
 import Data.Text (Text)
@@ -115,7 +115,7 @@ updateOpenTest test txs i (IntValue v',es,r) =
 updateOpenTest _ _ _ _ = error "Invalid type of test"
 
 -- | Given a 'SolTest', evaluate it and see if it currently passes.
-checkETest :: (MonadReader Env m, MonadState VM m, MonadThrow m)
+checkETest :: (MonadIO m, MonadReader Env m, MonadState VM m, MonadThrow m)
            => EchidnaTest -> m (TestValue, VM)
 checkETest test = case test.testType of
   Exploration -> (BoolValue True,) <$> get -- These values are never used
@@ -126,7 +126,7 @@ checkETest test = case test.testType of
   CallTest _ f -> checkCall f
 
 -- | Given a property test, evaluate it and see if it currently passes.
-checkProperty :: (MonadReader Env m, MonadState VM m, MonadThrow m)
+checkProperty :: (MonadIO m, MonadReader Env m, MonadState VM m, MonadThrow m)
               => Text -> Addr -> m (TestValue, VM)
 checkProperty f a = do
   vm <- get
@@ -139,7 +139,7 @@ checkProperty f a = do
       pure (BoolValue b, vm')
     _ -> pure (BoolValue True, vm) -- These values are never used
 
-runTx :: (MonadReader Env m, MonadState VM m, MonadThrow m)
+runTx :: (MonadIO m, MonadReader Env m, MonadState VM m, MonadThrow m)
       => Text -> (Addr -> Addr) -> Addr -> m (VM, VM)
 runTx f s a = do
   vm <- get -- save EVM state
@@ -160,7 +160,7 @@ getIntFromResult (Just (VMSuccess b)) =
 getIntFromResult _ = IntValue minBound
 
 -- | Given a property test, evaluate it and see if it currently passes.
-checkOptimization :: (MonadReader Env m, MonadState VM m, MonadThrow m)
+checkOptimization :: (MonadIO m, MonadReader Env m, MonadState VM m, MonadThrow m)
                   => Text -> Addr -> m (TestValue, VM)
 checkOptimization f a = do
   TestConf _ s <- asks (.cfg._tConf)

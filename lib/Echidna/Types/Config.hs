@@ -12,7 +12,10 @@ import Echidna.Types.Campaign (CampaignConf)
 import Echidna.Types.Solidity (SolConf)
 import Echidna.Types.Tx  (TxConf)
 import Echidna.Types.Test  (TestConf)
-import EVM.Types (Addr)
+import EVM.Types (Addr, W256)
+import Data.IORef (IORef)
+import Data.Map (Map)
+import EVM (Contract)
 
 data OperationMode = Interactive | NonInteractive OutputFormat deriving Show
 data OutputFormat = Text | JSON | None deriving Show
@@ -50,7 +53,9 @@ data EConfigWithUsage = EConfigWithUsage {
   unsetkeys :: HashSet Key
 }
 
-data Env = Env {
-  cfg :: EConfig,
-  dapp :: DappInfo
-}
+data Env = Env
+  { cfg :: EConfig
+  , dapp :: DappInfo
+  , fetchCacheContracts :: IORef (Map Addr Contract)
+  , fetchCacheSlots :: IORef (Map Addr (Map W256 W256))
+  }

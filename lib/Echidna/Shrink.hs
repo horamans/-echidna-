@@ -4,7 +4,7 @@ import Control.Monad ((<=<))
 import Control.Monad.Catch (MonadThrow, MonadCatch)
 import Control.Monad.Random.Strict (MonadRandom, getRandomR, uniform)
 import Control.Monad.Reader.Class (MonadReader, asks)
-import Control.Monad.State.Strict (MonadState(get, put), evalStateT)
+import Control.Monad.State.Strict (MonadState(get, put), evalStateT, MonadIO)
 import Data.Foldable (traverse_)
 import Data.Set qualified as Set
 import Data.List qualified as List
@@ -21,7 +21,7 @@ import Echidna.Types.Config
 import Echidna.Types.Campaign (CampaignConf(..))
 import Echidna.Test (getResultFromVM, checkETest)
 
-shrinkTest :: (MonadCatch m, MonadRandom m, MonadReader Env m)
+shrinkTest :: (MonadIO m, MonadCatch m, MonadRandom m, MonadReader Env m)
            => VM -> EchidnaTest -> m EchidnaTest
 shrinkTest vm test = do
   sl <- asks (.cfg._cConf._shrinkLimit)
@@ -52,7 +52,7 @@ shrinkTest vm test = do
 
 -- | Given a call sequence that solves some Echidna test, try to randomly generate a smaller one that
 -- still solves that test.
-shrinkSeq :: (MonadRandom m, MonadReader Env m, MonadThrow m, MonadState VM m)
+shrinkSeq :: (MonadIO m, MonadRandom m, MonadReader Env m, MonadThrow m, MonadState VM m)
           => m (TestValue, VM) -> TestValue -> [Tx] -> m (Maybe ([Tx], TestValue, VM))
 shrinkSeq f v xs = do
   strategies <- sequence [shorten, shrunk]

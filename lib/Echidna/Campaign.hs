@@ -11,20 +11,23 @@ import Control.Monad.Catch (MonadCatch(..), MonadThrow(..))
 import Control.Monad.Random.Strict (MonadRandom, RandT, evalRandT)
 import Control.Monad.Reader.Class (MonadReader)
 import Control.Monad.Reader (runReaderT, asks)
-import Control.Monad.State.Strict (MonadState(..), StateT(..), evalStateT, execStateT, gets)
+import Control.Monad.State.Strict (MonadState(..), StateT(..), evalStateT, execStateT, gets, MonadIO, liftIO)
 import Control.Monad.Trans (lift)
 import Control.Monad.Trans.Random.Strict (liftCatch)
 import Data.Binary.Get (runGetOrFail)
 import Data.ByteString.Lazy qualified as LBS
+import Data.Foldable qualified
 import Data.HashMap.Strict qualified as H
 import Data.Map (Map, unionWith, (\\), elems, keys, lookup, insert, mapWithKey)
+import Data.Map qualified as Map
 import Data.Maybe (fromMaybe, isJust, mapMaybe)
 import Data.Ord (comparing)
 import Data.Set qualified as DS
+import Data.Set qualified as Set
 import Data.Text (Text)
 import System.Random (mkStdGen)
 
-import EVM (Contract, VM(..), VMResult(..), bytecode)
+import EVM (Contract, VM(..), VMResult(..), bytecode, Cache(..))
 import qualified EVM (Env(..))
 import EVM.ABI (getAbi, AbiType(AbiAddressType), AbiValue(AbiAddress))
 import EVM.Types (Addr, Expr(ConcreteBuf))
@@ -40,11 +43,10 @@ import Echidna.Types.Corpus (InitialCorpus)
 import Echidna.Types.Coverage (coveragePoints)
 import Echidna.Types.Test
 import Echidna.Types.Buffer (viewBuffer)
-import Echidna.Types.Signature (makeBytecodeMemo)
+import Echidna.Types.Signature (makeBytecodeMemo, lookupBytecodeMetadata, getBytecodeMetadata)
 import Echidna.Types.Tx (TxCall(..), Tx(..), getResult, call)
 import Echidna.Types.World (World)
 import Echidna.Mutator.Corpus
-import qualified Data.Set as Set
 import Echidna.Events (extractEvents)
 
 instance MonadThrow m => MonadThrow (RandT g m) where
@@ -80,7 +82,7 @@ isSuccessful Campaign{_tests} =
 -- (2): The test is 'Open', and evaluating it breaks our runtime
 -- (3): The test is unshrunk, and we can shrink it
 -- Then update accordingly, keeping track of how many times we've tried to solve or shrink.
-updateTest :: (MonadCatch m, MonadRandom m, MonadReader Env m)
+updateTest :: (MonadIO m, MonadCatch m, MonadRandom m, MonadReader Env m)
            => VM -> (VM, [Tx]) -> EchidnaTest -> m EchidnaTest
 updateTest vmForShrink (vm, xs) test = do
   tl <- asks (.cfg._cConf._testLimit)
@@ -107,7 +109,7 @@ runUpdate f = let l = tests in use l >>= mapM f >>= (l .=)
 
 -- | Given an initial 'VM' state and a way to run transactions, evaluate a list of transactions, constantly
 -- checking if we've solved any tests or can shrink known solves.
-evalSeq :: (MonadCatch m, MonadRandom m, MonadReader Env m, MonadState (VM, Campaign) m)
+evalSeq :: (MonadIO m, MonadCatch m, MonadRandom m, MonadReader Env m, MonadState (VM, Campaign) m)
         => VM -> (Tx -> m a) -> [Tx] -> m [(Tx, a)]
 evalSeq vmForShrink e = go [] where
   go r xs = do
@@ -134,7 +136,7 @@ updateGasInfo ((t, _):ts) tseq gi = updateGasInfo ts (t:tseq) gi
 
 -- | Execute a transaction, capturing the PC and codehash of each instruction executed, saving the
 -- transaction if it finds new coverage.
-execTxOptC :: (MonadState (VM, Campaign) m, MonadThrow m) => Tx -> m (VMResult, Int)
+execTxOptC :: (MonadIO m, MonadReader Env m, MonadState (VM, Campaign) m, MonadThrow m) => Tx -> m (VMResult, Int)
 execTxOptC tx = do
   (vm, Campaign{_bcMemo, _coverage = oldCov}) <- get
   let cov = _2 . coverage
@@ -186,7 +188,7 @@ randseq (n,txs) ql o w = do
 
 -- | Given an initial 'VM' and 'World' state and a number of calls to generate, generate that many calls,
 -- constantly checking if we've solved any tests or can shrink known solves. Update coverage as a result
-callseq :: (MonadCatch m, MonadRandom m, MonadReader Env m, MonadState Campaign m)
+callseq :: (MonadIO m, MonadCatch m, MonadRandom m, MonadReader Env m, MonadState Campaign m)
         => InitialCorpus -> VM -> World -> Int -> m ()
 callseq ic v w ql = do
   conf <- asks (.cfg._cConf)
@@ -246,7 +248,7 @@ callseq ic v w ql = do
 -- | Run a fuzzing campaign given an initial universe state, some tests, and an optional dictionary
 -- to generate calls with. Return the 'Campaign' state once we can't solve or shrink anything.
 campaign
-  :: (MonadCatch m, MonadRandom m, MonadReader Env m)
+  :: (MonadIO m, MonadCatch m, MonadRandom m, MonadReader Env m)
   => StateT Campaign m a -- ^ Callback to run after each state update (for instrumentation)
   -> VM                  -- ^ Initial VM state
   -> World               -- ^ Initial world state

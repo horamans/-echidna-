@@ -5,15 +5,19 @@ import Control.Arrow (first)
 import Control.Monad (liftM2, when, unless, forM_)
 import Control.Monad.Catch (MonadThrow(..))
 import Control.Monad.Extra (whenM)
+import Control.Monad.Reader (ReaderT(runReaderT))
 import Control.Monad.State.Strict (execStateT)
 import Data.Foldable (toList)
 import Data.HashMap.Strict qualified as M
+import Data.IORef (newIORef)
 import Data.List (find, partition, isSuffixOf, (\\))
 import Data.List.NonEmpty qualified as NE
 import Data.List.NonEmpty.Extra qualified as NEE
 import Data.Map (Map, keys, elems, unions, member)
 import Data.Map qualified as Map
 import Data.Maybe (isJust, isNothing, catMaybes, listToMaybe)
+import Data.Set (Set)
+import Data.Set qualified as Set
 import Data.Text (Text, isPrefixOf, isSuffixOf, append)
 import Data.Text qualified as T
 import Data.Text.Lens (unpacked)
@@ -23,7 +27,7 @@ import System.Exit (ExitCode(..))
 import System.FilePath.Posix ((</>))
 import System.IO (openFile, IOMode(..))
 
-import EVM hiding (contracts, path)
+import EVM hiding (Env, contracts, path)
 import EVM qualified (contracts)
 import EVM.ABI
 import EVM.Solidity
@@ -37,13 +41,12 @@ import Echidna.Fetch (deployContracts, deployBytecodes)
 import Echidna.Processor
 import Echidna.RPC (loadEthenoBatch)
 import Echidna.Test (createTests, isAssertionMode, isPropertyMode, isDapptestMode)
+import Echidna.Types.Config (EConfig(..), Env(..))
 import Echidna.Types.Signature (ContractName, FunctionHash, SolSignature, SignatureMap, getBytecodeMetadata)
 import Echidna.Types.Solidity hiding (deployBytecodes, deployContracts)
 import Echidna.Types.Test (EchidnaTest(..))
 import Echidna.Types.Tx (basicTx, createTxWithValue, unlimitedGasPerBlock, initialTimestamp, initialBlockNumber)
 import Echidna.Types.World (World(..))
-import qualified Data.Set as Set
-import Data.Set (Set)
 
 -- | Given a list of source caches (SourceCaches) and an optional contract name,
 -- select one that includes that contract (if possible). Otherwise, use the first source
@@ -153,20 +156,23 @@ abiOf pref cc = fallback NE.:| filter (not . isPrefixOf pref . fst) (elems (cc._
 -- testing and extract an ABI and list of tests. Throws exceptions if anything returned doesn't look
 -- usable for Echidna. NOTE: Contract names passed to this function should be prefixed by the
 -- filename their code is in, plus a colon.
-loadSpecified :: SolConf -> Maybe Text -> [SolcContract] -> IO (VM, EventMap, NE.NonEmpty SolSignature, [Text], SignatureMap)
-loadSpecified solConf name cs = do
+loadSpecified
+  :: EConfig -> Maybe Text -> [SolcContract]
+  -> IO (VM, EventMap, NE.NonEmpty SolSignature, [Text], SignatureMap)
+loadSpecified conf name cs = do
+  -- Local variables
+  let solConf = conf._sConf
+  let SolConf ca d ads bala balc mcs pref _ _ libs _ fp dpc dpb ma tm _ fs = solConf
+
   -- Pick contract to load
   c <- choose cs name
   when (isNothing name && length cs > 1 && not solConf._quiet) $
     putStrLn "Multiple contracts found, only analyzing the first"
   unless solConf._quiet . putStrLn $ "Analyzing contract: " <> c ^. contractName . unpacked
 
-  -- Local variables
-  let SolConf ca d ads bala balc mcs pref _ _ libs _ fp dpc dpb ma tm _ fs = solConf
-
   -- generate the complete abi mapping
   let bc = c._creationCode
-      abi = liftM2 (,) (view methodName) (fmap snd . view methodInputs) <$> toList (c._abiMap)
+      abi = liftM2 (,) (view methodName) (fmap snd . view methodInputs) <$> toList c._abiMap
       con = view constructorInputs c
       (tests, funs) = partition (isPrefixOf pref . fst) abi
 
@@ -203,24 +209,27 @@ loadSpecified solConf name cs = do
     Nothing    -> do
       -- dappinfo for debugging in case of failure
       let di = dappInfo "/" (Map.fromList $ map (\x -> (x._contractName, x)) cs) mempty
+      refContracts <- newIORef mempty
+      refSlots <- newIORef mempty
+      let echidnaEnv = Env{ cfg = conf, dapp = di, fetchCacheContracts = refContracts, fetchCacheSlots = refSlots }
 
       -- library deployment
-      vm0 <- deployContracts di (zip [addrLibrary ..] ls) d blank
+      vm0 <- runReaderT (deployContracts (zip [addrLibrary ..] ls) d blank) echidnaEnv
 
       -- additional contract deployment (by name)
       cs' <- mapM ((choose cs . Just) . T.pack . snd) dpc
-      vm1 <- deployContracts di (zip (map fst dpc) cs') d vm0
+      vm1 <- runReaderT (deployContracts (zip (map fst dpc) cs') d vm0) echidnaEnv
 
       -- additional contract deployment (bytecode)
-      vm2 <- deployBytecodes di dpb d vm1
+      vm2 <- runReaderT (deployBytecodes dpb d vm1) echidnaEnv
 
       -- main contract deployment
-      let deployment = execTx $ createTxWithValue bc d ca (fromInteger unlimitedGasPerBlock) (fromInteger balc) (0, 0)
+      let deployment = runReaderT (execTx $ createTxWithValue bc d ca (fromInteger unlimitedGasPerBlock) (fromInteger balc) (0, 0)) echidnaEnv
       vm3 <- execStateT deployment vm2
       when (isNothing $ currentContract vm3) (throwM $ DeploymentFailed ca $ T.unlines $ extractEvents True di vm3)
 
       -- Run
-      let transaction = execTx $ uncurry basicTx setUpFunction d ca (fromInteger unlimitedGasPerBlock) (0, 0)
+      let transaction = runReaderT (execTx $ uncurry basicTx setUpFunction d ca (fromInteger unlimitedGasPerBlock) (0, 0)) echidnaEnv
       vm4 <- if isDapptestMode tm && setUpFunction `elem` abi then execStateT transaction vm3 else return vm3
 
       case vm4._result of
@@ -239,8 +248,8 @@ loadSpecified solConf name cs = do
 -- the first contract in the file. Take said contract and return an initial VM state with it loaded,
 -- its ABI (as 'SolSignature's), and the names of its Echidna tests. NOTE: unlike 'loadSpecified',
 -- contract names passed here don't need the file they occur in specified.
-loadWithCryticCompile :: SolConf -> NE.NonEmpty FilePath -> Maybe Text -> IO (VM, EventMap, NE.NonEmpty SolSignature, [Text], SignatureMap)
-loadWithCryticCompile solConf fp name = contracts solConf fp >>= \(cs, _) -> loadSpecified solConf name cs
+loadWithCryticCompile :: EConfig -> NE.NonEmpty FilePath -> Maybe Text -> IO (VM, EventMap, NE.NonEmpty SolSignature, [Text], SignatureMap)
+loadWithCryticCompile econfig fp name = contracts econfig._sConf fp >>= \(cs, _) -> loadSpecified econfig name cs
 
 
 -- | Given the results of 'loadSolidity', assuming a single-contract test, get everything ready
@@ -287,10 +296,10 @@ prepareHashMaps cs as m =
 
 -- | Basically loadSolidity, but prepares the results to be passed directly into
 -- a testing function.
-loadSolTests :: SolConf -> NE.NonEmpty FilePath -> Maybe Text -> IO (VM, World, [EchidnaTest])
-loadSolTests solConf fp name = do
-  x <- loadWithCryticCompile solConf fp name
-  pure $ prepareForTest' solConf x
+loadSolTests :: EConfig -> NE.NonEmpty FilePath -> Maybe Text -> IO (VM, World, [EchidnaTest])
+loadSolTests econfig fp name = do
+  x <- loadWithCryticCompile econfig fp name
+  pure $ prepareForTest' econfig._sConf x
 
 mkLargeAbiInt :: Int -> AbiValue
 mkLargeAbiInt i = AbiInt i $ 2 ^ (i - 1) - 1

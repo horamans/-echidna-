@@ -6,13 +6,20 @@ module Echidna.Exec where
 
 import Control.Lens
 import Control.Monad.Catch (MonadThrow(..))
-import Control.Monad.State.Strict (MonadState(get, put), execState, runStateT)
+import Control.Monad.State.Strict (MonadState(get, put), execState, runStateT, liftIO, MonadIO)
+import Control.Monad.Reader (MonadReader, asks)
+import Data.IORef (readIORef, atomicWriteIORef)
 import Data.Map qualified as M
+import Data.Map qualified as Map
 import Data.Maybe (fromMaybe)
 import Data.Set qualified as S
+import Data.Text qualified as Text
+import Text.Read (readMaybe)
+import System.Environment (lookupEnv)
 
-import EVM hiding (tx)
+import EVM hiding (Env, cache, contract, tx, value)
 import EVM.Exec (exec, vmForEthrunCreation)
+import EVM.Fetch qualified
 import EVM.Types (Expr(ConcreteBuf, Lit))
 
 import Echidna.Events (emptyEvents)
@@ -22,6 +29,7 @@ import Echidna.Types.Buffer (viewBuffer)
 import Echidna.Types.Coverage (CoverageMap)
 import Echidna.Types.Signature (BytecodeMemo, lookupBytecodeMetadata)
 import Echidna.Types.Tx (TxCall(..), Tx, TxResult(..), call, dst, initialTimestamp, initialBlockNumber)
+import Echidna.Types.Config (Env(..))
 
 -- | Broad categories of execution failures: reversions, illegal operations, and ???.
 data ErrorClass = RevertE | IllegalE | UnknownE
@@ -59,7 +67,8 @@ vmExcept e = throwM $ case VMFailure e of {Illegal -> IllegalExec e; _ -> Unknow
 
 -- | Given an error handler `onErr`, an execution strategy `executeTx`, and a transaction `tx`,
 -- execute that transaction using the given execution strategy, calling `onErr` on errors.
-execTxWith :: MonadState s m => Lens' s VM -> (Error -> m ()) -> m VMResult -> Tx -> m (VMResult, Int)
+execTxWith :: (MonadIO m, MonadState s m, MonadReader Env m)
+           => Lens' s VM -> (Error -> m ()) -> m VMResult -> Tx -> m (VMResult, Int)
 execTxWith l onErr executeTx tx = do
   vm <- use l
   if hasSelfdestructed vm tx.dst then
@@ -81,19 +90,68 @@ execTxWith l onErr executeTx tx = do
     -- the execution by recursively calling `runFully`.
     case getQuery vmResult of
       -- A previously unknown contract is required
-      Just (PleaseFetchContract _ continuation) -> do
-        -- Use the empty contract
-        l %= execState (continuation emptyAccount)
-        runFully
+      Just (PleaseFetchContract addr continuation) -> do
+        cacheRef <- asks (.fetchCacheContracts)
+        cache <- liftIO $ readIORef cacheRef
+        case Map.lookup addr cache of
+          Just contract -> l %= execState (continuation contract)
+          Nothing ->
+            getRpcUrl >>= \case
+              Just rpcUrl -> do
+                rpcBlock <- getRpcBlock
+                ret <- liftIO $ EVM.Fetch.fetchContractFrom rpcBlock rpcUrl addr
+                case ret of
+                  Just contract -> do
+                    l %= execState (continuation contract)
+                    liftIO $ atomicWriteIORef cacheRef $ Map.insert addr contract cache
+                  Nothing -> do
+                   -- TODO: How should we fail here? It could be a network error,
+                    -- RPC server returning junk etc.
+                    l %= execState (continuation emptyAccount)
+              Nothing ->
+                -- TODO: How should we fail here? RPC is not configured but VM
+                -- wants to fetch
+                l %= execState (continuation emptyAccount)
+        runFully -- resume execution
 
       -- A previously unknown slot is required
-      Just (PleaseFetchSlot _ _ continuation) -> do
-        -- Use the zero slot
-        l %= execState (continuation 0)
-        runFully
+      Just (PleaseFetchSlot addr slot continuation) -> do
+        cacheRef <- asks (.fetchCacheSlots)
+        cache <- liftIO $ readIORef cacheRef
+        case Map.lookup addr cache >>= Map.lookup slot of
+          Just value -> l %= execState (continuation value)
+          Nothing -> do
+            getRpcUrl >>= \case
+              Just rpcUrl -> do
+                rpcBlock <- getRpcBlock
+                ret <- liftIO $ EVM.Fetch.fetchSlotFrom rpcBlock rpcUrl addr slot
+                case ret of
+                  Just value -> do
+                    l %= execState (continuation value)
+                    liftIO $ atomicWriteIORef cacheRef $
+                      Map.insertWith Map.union addr (Map.singleton slot value) cache
+                  Nothing ->
+                    -- TODO: How should we fail here? It could be a network error,
+                    -- RPC server returning junk etc.
+                    l %= execState (continuation 0)
+              Nothing ->
+                -- Use the zero slot
+                l %= execState (continuation 0)
+        runFully -- resume execution
 
       -- No queries to answer, the tx is fully executed and the result is final
       _ -> pure vmResult
+    where
+    -- TODO: Currently, for simplicity we get those values from env vars.
+    -- Make it posible to pass through the config file and CLI
+    getRpcUrl = liftIO $ do
+      val <- lookupEnv "ECHIDNA_RPC_URL"
+      pure (Text.pack <$> val)
+    getRpcBlock = liftIO $ do
+      -- TODO: Is the latest block a good default? It makes fuzzing hard to
+      -- reproduce. Rethink this.
+      val <- lookupEnv "ECHIDNA_RPC_BLOCK"
+      pure $ maybe EVM.Fetch.Latest EVM.Fetch.BlockNumber (val >>= readMaybe)
 
   -- | Handles reverts, failures and contract creations that might be the result
   -- (`vmResult`) of executing transaction `tx`.
@@ -123,12 +181,12 @@ execTxWith l onErr executeTx tx = do
     _ -> pure ()
 
 -- | Execute a transaction "as normal".
-execTx :: (MonadState VM m, MonadThrow m) => Tx -> m (VMResult, Int)
+execTx :: (MonadIO m, MonadState VM m, MonadReader Env m, MonadThrow m) => Tx -> m (VMResult, Int)
 execTx = execTxWith id vmExcept $ fromEVM exec
 
 -- | Execute a transaction, logging coverage at every step.
 execTxWithCov
-  :: (MonadState VM m, MonadThrow m)
+  :: (MonadIO m, MonadState VM m, MonadReader Env m, MonadThrow m)
   => BytecodeMemo
   -> Tx
   -> m ((VMResult, Int), CoverageMap)
